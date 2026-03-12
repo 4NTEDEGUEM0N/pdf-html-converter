@@ -1,6 +1,7 @@
 import fitz
 import os
 import time
+import shutil
 import google.generativeai as genai
 from PIL import Image
 from prompt_html import get_prompt, get_html
@@ -8,13 +9,17 @@ import re
 import base64
 import html
 from dotenv import load_dotenv
+from typing import List, Dict, Optional, Tuple, Any
 
 load_dotenv()
 
 CHAVE_API = os.getenv("CHAVE_API")
-genai.configure(api_key=CHAVE_API)
+if not CHAVE_API:
+    print("Aviso: CHAVE_API não encontrada no ambiente.")
+else:
+    genai.configure(api_key=CHAVE_API)
 
-def parse_paginas(string_paginas: str, total_paginas: int):
+def parse_paginas(string_paginas: str, total_paginas: int) -> Optional[List[int]]:
     if not string_paginas.strip():
         return list(range(total_paginas))
     
@@ -48,29 +53,30 @@ def parse_paginas(string_paginas: str, total_paginas: int):
 
     return sorted(list(paginas))
 
-def pdf_para_imagens(caminho_pdf: str, paginas_selecionadas: list, dpi: int = 100):
+def pdf_para_imagens(caminho_pdf: str, paginas_selecionadas: List[int], dpi: int = 100) -> Tuple[str, List[str]]:
     pdf_basename = os.path.basename(caminho_pdf)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     pasta_saida = os.path.join('temp_processing', f"{pdf_basename}_{timestamp}")
     os.makedirs(pasta_saida, exist_ok=True)
     image_paths = []
 
-    documento = fitz.open(caminho_pdf)
-
-    for numero_pagina in paginas_selecionadas:
-        pagina = documento.load_page(numero_pagina)
-        
-        imagem = pagina.get_pixmap(dpi=dpi)
-        
-        nome_arquivo = os.path.join(f"{pasta_saida}", f"pagina_{numero_pagina + 1}.png")
-        image_paths.append(nome_arquivo)
-        
-        imagem.save(nome_arquivo)
-        print(f"Página {numero_pagina + 1} salva como {nome_arquivo}")
+    try:
+        documento = fitz.open(caminho_pdf)
+        for numero_pagina in paginas_selecionadas:
+            pagina = documento.load_page(numero_pagina)
+            imagem = pagina.get_pixmap(dpi=dpi)
+            
+            nome_arquivo = os.path.join(pasta_saida, f"pagina_{numero_pagina + 1}.png")
+            image_paths.append(nome_arquivo)
+            
+            imagem.save(nome_arquivo)
+            print(f"Página {numero_pagina + 1} salva como {nome_arquivo}")
+    except Exception as e:
+        print(f"Erro ao converter PDF para imagens: {e}")
 
     return pasta_saida, image_paths
 
-def analisar_imagens_com_gemini(pdf_basename: str, lista_caminhos: list):
+def analisar_imagens_com_gemini(pdf_basename: str, lista_caminhos: List[str]) -> List[Dict[str, Any]]:
     modelo = genai.GenerativeModel('gemini-2.5-flash-lite')
     respostas = []
 
@@ -86,14 +92,18 @@ def analisar_imagens_com_gemini(pdf_basename: str, lista_caminhos: list):
             with open(caminho, "rb") as image_file:
                 image_data = image_file.read()
 
-            current_page_num_in_doc = caminho.split("pagina_")[1].split(".")[0]
+            match_pagina = re.search(r"pagina_(\d+)\.png$", caminho)
+            current_page_num_in_doc = match_pagina.group(1) if match_pagina else "Desconhecida"
+            
             base64_image_data = base64.b64encode(image_data).decode('utf-8')
             prompt = get_prompt(pdf_basename, imagem.size, current_page_num_in_doc)
             
             response = modelo.generate_content([prompt, imagem])
 
-
-            if response and response.candidates:
+            final_finish_reason = 'UNKNOWN'
+            html_body = None
+            
+            if response and hasattr(response, 'candidates') and response.candidates:
                 final_finish_reason = response.candidates[0].finish_reason.value if response.candidates[0].finish_reason else 'UNKNOWN'
 
                 response_text_content = response.text
@@ -102,19 +112,16 @@ def analisar_imagens_com_gemini(pdf_basename: str, lista_caminhos: list):
                         part.text for part in response.candidates[0].content.parts if hasattr(part, 'text')
                     )
 
-                html_body = None
                 if response_text_content:
                     match = re.search(r"```html\s*(.*?)\s*```", response_text_content, re.DOTALL | re.IGNORECASE)
                     if match:
                         html_body = match.group(1).strip()
                     else:
-                        # Fallback for cases where the AI might forget the markdown block
                         trimmed_text = response_text_content.strip()
                         if trimmed_text.startswith("<") and trimmed_text.endswith(">") and \
-                            re.search(r"<p|<div|<span|<table|<ul|<ol|<h[1-6]", trimmed_text, re.IGNORECASE): # Basic check for HTML content
+                            re.search(r"<p|<div|<span|<table|<ul|<ol|<h[1-6]", trimmed_text, re.IGNORECASE):
                             html_body = trimmed_text
-                        else:
-                            html_body = None
+                            
                     if html_body:
                         html_body = re.sub(r'<bdi>([a-zA-Z0-9_](?:<sup>.*?</sup>)?)</bdi>', r'\1', html_body)
                         html_body = re.sub(r'<bdi>(\\[a-zA-Z]+(?:\{.*?\})?(?:\s*\^\{.*?\})?(?:\s*_\{.*?\})?)</bdi>', r'\1',
@@ -125,31 +132,59 @@ def analisar_imagens_com_gemini(pdf_basename: str, lista_caminhos: list):
                 print(f"Erro: Falha ao extrair HTML para {pdf_basename} (pág {current_page_num_in_doc}).")
                 if response:
                     print(f"Texto bruto (300c): {str(response.text)[:300]}...")
-                    print(f"Motivo: {final_finish_reason} ({response.candidates[0].finish_reason.name})")
+                    try:
+                        print(f"Motivo: {final_finish_reason} ({response.candidates[0].finish_reason.name})")
+                    except AttributeError:
+                        print(f"Motivo: {final_finish_reason}")
             
-            resposta = {"page_num_in_doc": current_page_num_in_doc, "body": html_body, "base64_image": base64_image_data}
+            resposta = {
+                "page_num_in_doc": current_page_num_in_doc, 
+                "body": html_body, 
+                "base64_image": base64_image_data,
+                "status": "success"
+            }
             respostas.append(resposta)
-            print(f"✅ Sucesso!")
+            print("✅ Sucesso!")
             
             time.sleep(2)
             
         except Exception as e:
             print(f"❌ Erro ao processar {caminho}: {e}")
-            respostas.append(f"Erro na extração: {e}")
+            match_pagina = re.search(r"pagina_(\d+)\.png$", caminho)
+            current_page_num = match_pagina.group(1) if match_pagina else "Desconhecida"
+            respostas.append({
+                "page_num_in_doc": current_page_num,
+                "body": None,
+                "base64_image": None,
+                "status": "error",
+                "error_msg": str(e)
+            })
             
     return respostas
 
-def merge_html(pdf_filename_title: str, report_button: bool, content_list: list[dict], output_path: str = "output/"):
+def merge_html(pdf_filename_title: str, report_button: bool, content_list: List[Dict[str, Any]], output_path: str = "output"):
     merged_html, report_button_forms = get_html(pdf_filename_title, report_button)
 
     for i, content_data in enumerate(content_list):
-        page_num_in_doc = content_data.get("page_num_in_doc")
-        html_body = content_data.get("body", "")
+        page_num_in_doc = content_data.get("page_num_in_doc", "Desconhecida")
+        html_body = content_data.get("body")
         base64_image = content_data.get("base64_image")
-        if i > 0: merged_html += f"\n<hr class=\"page-separator\" aria-hidden=\"true\">\n"
+        status = content_data.get("status", "success")
+        error_msg = content_data.get("error_msg", "")
+        
+        if i > 0: 
+            merged_html += f"\n<hr class=\"page-separator\" aria-hidden=\"true\">\n"
+            
         merged_html += f"<article class='page-content' id='page-{page_num_in_doc}' aria-labelledby='page-heading-{page_num_in_doc}'>\n"
         merged_html += f"<h2 id='page-heading-{page_num_in_doc}'>Página {page_num_in_doc}</h2>\n"
-        merged_html += html_body if html_body else f"<p><i>[Conteúdo não pôde ser extraído para a página {page_num_in_doc}.]</i></p>"
+        
+        if html_body:
+            merged_html += html_body
+        elif status == "error":
+            merged_html += f"<p><i>[Erro ao processar a página {page_num_in_doc}: {html.escape(error_msg)}]</i></p>"
+        else:
+            merged_html += f"<p><i>[Conteúdo não pôde ser extraído para a página {page_num_in_doc}.]</i></p>"
+            
         if html_body and base64_image and "[Descrição da imagem:" in html_body:
             safe_alt_text = html.escape(f"Imagem original da página {page_num_in_doc}")
             merged_html += f"""
@@ -161,45 +196,66 @@ def merge_html(pdf_filename_title: str, report_button: bool, content_list: list[
                 </details>
             """
         merged_html += "\n</article>\n"
+        
     merged_html += f"\n    </main> \n    {report_button_forms}\n</body>\n</html>"
 
-    #full_output_path = os.path.join(output_path, pdf_filename_title, ".html")
-    full_output_path = "output/teste.html"
+    os.makedirs(output_path, exist_ok=True)
+    nome_sem_extensao = os.path.splitext(pdf_filename_title)[0]
+    full_output_path = os.path.join(output_path, f"{nome_sem_extensao}.html")
+    
     with open(full_output_path, "w", encoding="utf-8") as f: 
         f.write(merged_html)
-
+        
+    print(f"HTML salvo com sucesso em: {full_output_path}")
+    return full_output_path
 
 def processar_pdf(caminho_pdf: str, string_paginas: str):
-    with fitz.open(caminho_pdf) as temp_doc:
-        total_paginas = temp_doc.page_count
+    if not os.path.exists(caminho_pdf):
+        print(f"Erro: Arquivo PDF não encontrado em {caminho_pdf}")
+        return
+
+    try:
+        with fitz.open(caminho_pdf) as temp_doc:
+            total_paginas = temp_doc.page_count
+    except Exception as e:
+        print(f"Erro ao abrir o PDF {caminho_pdf}: {e}")
+        return
     
     print("Iniciando o Parser das Páginas")
     paginas_selecionadas = parse_paginas(string_paginas, total_paginas)
     if paginas_selecionadas is None:
-        print("Falha no parser de páginas")
+        print("Falha no parser de páginas. Verifique o formato inserido.")
         return
-    print("Fim do Parse das Páginas")
-    print()
+    print(f"Páginas a processar: {[p + 1 for p in paginas_selecionadas]}")
+    print("Fim do Parse das Páginas\n")
 
     input("Aperte ENTER para continuar...")
-    print()
-
-    print("Convertendo o PDF para imagens")
+    print("\nConvertendo o PDF para imagens...")
     pasta_saida, image_paths = pdf_para_imagens(caminho_pdf, paginas_selecionadas)
+    
     if not image_paths: 
-        print("Falha ao converter PDF para imagens.")
+        print("Falha ao converter PDF para imagens ou nenhuma imagem gerada.")
+        if os.path.exists(pasta_saida):
+            shutil.rmtree(pasta_saida, ignore_errors=True)
         return
-    print("Fim da conversão")
-    print()
+        
+    print("Fim da conversão\n")
 
-    print("Gerando HTML de cada imagem")
+    print("Gerando HTML de cada imagem...")
     pdf_basename = os.path.basename(caminho_pdf)
     respostas = analisar_imagens_com_gemini(pdf_basename, image_paths)
-    print("Os HTML foram gerados")
+    print("Os HTML foram gerados\n")
 
-    print("Mesclando os HTML")
+    print("Mesclando os HTML...")
     merge_html(pdf_basename, True, respostas)
-    print("HTML Mesclado")
+    print("HTML Mesclado\n")
+    
+    print("Limpando arquivos temporários...")
+    try:
+        shutil.rmtree(pasta_saida)
+        print("Arquivos temporários removidos com sucesso.")
+    except Exception as e:
+        print(f"Aviso: Não foi possível remover a pasta temporária {pasta_saida}: {e}")
 
-
-processar_pdf("input/semana_04ap_gab.pdf", "1")
+if __name__ == "__main__":
+    processar_pdf("input/semana_04ap_gab.pdf", "1")
